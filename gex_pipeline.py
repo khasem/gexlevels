@@ -48,6 +48,7 @@ from pathlib import Path
 
 import requests
 
+CALC_VERSION = "1.1.0"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "cboe").lower()
 API_KEY     = os.environ.get("POLYGON_API_KEY", "")
@@ -225,11 +226,14 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
         daily_move = spot * iv * math.sqrt(1 / 252) if iv else 0.0
     session = {"ceiling": round(spot + daily_move, 2), "floor": round(spot - daily_move, 2)} if daily_move else {}
 
-    net_full = {k: round(v["call"] - v["put"], 2) for k, v in per_strike.items()}
+    profile = {k: {"call": round(v["call"], 0), "put": round(v["put"], 0),
+                   "net": round(v["call"] - v["put"], 0)} for k, v in per_strike.items()}
+    net_full = {k: v["net"] for k, v in profile.items()}
     net_total = sum(net_full.values())
     regime = "POSITIEF (+GEX, mean-reversion)" if net_total > 0 else "NEGATIEF (-GEX, momentum)"
     return {"spot": spot, "full": full, "0dte": dte0, "session": session,
-            "net": net_full, "vol": vol_map, "net_total": net_total, "regime": regime}
+            "net": net_full, "vol": vol_map, "net_total": net_total, "regime": regime,
+            "profile": profile, "em_expiration": nearest_exp.isoformat() if nearest_exp else None}
 
 
 # ────────────────────────────── Pine Seeds output ──────────────────────────────
@@ -345,13 +349,17 @@ def main() -> None:
         "date": today.isoformat(),
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "underlying": UNDERLYING, "spot": round(spot, 2),
+        "data_source": DATA_SOURCE.upper(),
+        "calculation_version": CALC_VERSION,
+        "expiration_used": res.get("em_expiration"),
+        "strike_range_pct": RANGE_PCT, "max_dte": MAX_DTE,
         "regime": res["regime"], "net_total_gex": round(res["net_total"], 0),
         "levels": {"gamma_flip": f.get("flip"), "call_wall": f.get("call_wall"),
                    "put_wall": f.get("put_wall"), "gamma_levels": gl,
                    "0dte": {"flip": d0.get("flip"), "call_wall": d0.get("call_wall"),
                             "put_wall": d0.get("put_wall")},
                    "session": ses, "correlated": cgl},
-        "net_per_strike": {f"{k:g}": v for k, v in sorted(res.get("net", {}).items())},
+        "gamma_profile": {f"{k:g}": v for k, v in sorted(res.get("profile", {}).items())},
     }
     (hist_dir / f"{pfx}_{today.isoformat()}.json").write_text(json.dumps(snapshot, indent=1))
 
