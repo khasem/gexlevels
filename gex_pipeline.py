@@ -41,12 +41,14 @@ import re
 import sys
 import math
 import time
+import json
 import datetime as dt
 from collections import defaultdict
 from pathlib import Path
 
 import requests
 
+EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "cboe").lower()
 API_KEY     = os.environ.get("POLYGON_API_KEY", "")
 UNDERLYING  = os.environ.get("UNDERLYING", "QQQ")
@@ -96,7 +98,8 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float]:
         out.append({"strike": strike, "type": typ, "exp": exp,
                     "gamma": float(gamma), "oi": float(oi),
                     "iv": float(iv) if iv else None,
-                    "vol": float(o.get("volume") or 0)})
+                    "vol": float(o.get("volume") or 0),
+                    "bid": float(o.get("bid") or 0), "ask": float(o.get("ask") or 0)})
     if not spot:
         sys.exit(f"FOUT: geen spotprijs in CBOE-respons voor {ticker}")
     return out, spot
@@ -134,7 +137,9 @@ def fetch_polygon(ticker: str) -> tuple[list[dict], float]:
                             "exp": dt.date.fromisoformat(exp_s),
                             "gamma": float(gamma), "oi": float(oi),
                             "iv": c.get("implied_volatility"),
-                            "vol": float((c.get("day") or {}).get("volume") or 0)})
+                            "vol": float((c.get("day") or {}).get("volume") or 0),
+                            "bid": float((c.get("last_quote") or {}).get("bid") or 0),
+                            "ask": float((c.get("last_quote") or {}).get("ask") or 0)})
         url = payload.get("next_url")
         params = {"apiKey": API_KEY}
     if math.isnan(spot):
@@ -155,6 +160,8 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
     per_strike_0dte: dict[float, dict] = defaultdict(lambda: {"call": 0.0, "put": 0.0})
     vol_map: dict[float, float] = {}
     atm_ivs: list[float] = []
+    straddle: dict[tuple, float] = {}          # (exp, strike, type) → mid-prijs
+    nearest_exp: dt.date | None = None
 
     lo, hi = spot * (1 - RANGE_PCT), spot * (1 + RANGE_PCT)
     max_exp = today + dt.timedelta(days=MAX_DTE)
@@ -163,13 +170,20 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
         k, exp = c["strike"], c["exp"]
         if not (lo <= k <= hi) or exp < today or exp > max_exp:
             continue
-        gex = c["gamma"] * c["oi"] * 100 * spot     # $-gamma per 1%-move
+        # Notionele GEX: gamma × OI × multiplier(100) × spot² × 1%  ($-gamma per 1%-move)
+        gex = c["gamma"] * c["oi"] * 100 * spot * spot * 0.01
         per_strike[k][c["type"]] += gex
         vol_map[k] = vol_map.get(k, 0.0) + c.get("vol", 0.0)
         if exp == today:
             per_strike_0dte[k][c["type"]] += gex
         if c["iv"] and abs(k - spot) / spot <= 0.01 and (exp - today).days <= 5:
             atm_ivs.append(float(c["iv"]))
+        # ATM-straddle verzamelen (dichtstbijzijnde expiratie, strikes binnen 2% van spot)
+        bid, ask = c.get("bid", 0), c.get("ask", 0)
+        if bid > 0 and ask > 0 and abs(k - spot) / spot <= 0.02:
+            if nearest_exp is None or exp < nearest_exp:
+                nearest_exp = exp
+            straddle[(exp, k, c["type"])] = (bid + ask) / 2
 
     def derive(strikes: dict[float, dict]) -> dict:
         if not strikes:
@@ -178,27 +192,44 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
         net = {k: strikes[k]["call"] - strikes[k]["put"] for k in ks}
         call_wall = max(ks, key=lambda k: strikes[k]["call"])
         put_wall  = max(ks, key=lambda k: strikes[k]["put"])
-        cum, crossings, prev = 0.0, [], None
+        # Gamma Flip: exacte nul-doorgang van cumulatieve netto GEX via lineaire
+        # interpolatie tussen strikes; de doorgang die het dichtst bij spot ligt wint.
+        cum, crossings = 0.0, []
+        prev_cum, prev_k = None, None
         for k in ks:
             cum += net[k]
-            if prev is not None and (prev < 0 <= cum or prev > 0 >= cum):
-                crossings.append(k)
-            prev = cum
-        flip = min(crossings, key=lambda k: abs(k - spot)) if crossings else min(ks, key=lambda k: abs(k - spot))
+            if prev_cum is not None and (prev_cum < 0 <= cum or prev_cum > 0 >= cum) and cum != prev_cum:
+                frac = (0 - prev_cum) / (cum - prev_cum)
+                crossings.append(prev_k + frac * (k - prev_k))
+            prev_cum, prev_k = cum, k
+        flip = round(min(crossings, key=lambda x: abs(x - spot)), 2) if crossings else min(ks, key=lambda k: abs(k - spot))
         rest = [k for k in ks if k not in (call_wall, put_wall)]
         ranked = sorted(rest, key=lambda k: abs(net[k]), reverse=True)[:10]
         return {"flip": flip, "call_wall": call_wall, "put_wall": put_wall, "gamma_levels": ranked}
 
     full, dte0 = derive(per_strike), derive(per_strike_0dte)
 
-    # CBOE geeft IV soms in procenten (bv. 18.5) i.p.v. decimaal (0.185) → normaliseren
-    ivs = [v / 100 if v > 3 else v for v in atm_ivs]
-    iv = sorted(ivs)[len(ivs) // 2] if ivs else 0.0
-    daily_move = spot * iv * math.sqrt(1 / 252) if iv else 0.0
+    # Session Range — voorkeursmodel: expected move ≈ EM_FACTOR × ATM-straddle
+    # van de dichtstbijzijnde expiratie (publieke standaardbenadering).
+    daily_move = 0.0
+    if nearest_exp is not None:
+        pairs = [k for k in {kk for (e, kk, _t) in straddle if e == nearest_exp}
+                 if (nearest_exp, k, "call") in straddle and (nearest_exp, k, "put") in straddle]
+        if pairs:
+            atm_k = min(pairs, key=lambda k: abs(k - spot))
+            daily_move = EM_FACTOR * (straddle[(nearest_exp, atm_k, "call")] + straddle[(nearest_exp, atm_k, "put")])
+    if not daily_move:
+        # Fallback: IV-model (CBOE geeft IV soms in % i.p.v. decimaal → normaliseren)
+        ivs = [v / 100 if v > 3 else v for v in atm_ivs]
+        iv = sorted(ivs)[len(ivs) // 2] if ivs else 0.0
+        daily_move = spot * iv * math.sqrt(1 / 252) if iv else 0.0
     session = {"ceiling": round(spot + daily_move, 2), "floor": round(spot - daily_move, 2)} if daily_move else {}
 
     net_full = {k: round(v["call"] - v["put"], 2) for k, v in per_strike.items()}
-    return {"spot": spot, "full": full, "0dte": dte0, "session": session, "net": net_full, "vol": vol_map}
+    net_total = sum(net_full.values())
+    regime = "POSITIEF (+GEX, mean-reversion)" if net_total > 0 else "NEGATIEF (-GEX, momentum)"
+    return {"spot": spot, "full": full, "0dte": dte0, "session": session,
+            "net": net_full, "vol": vol_map, "net_total": net_total, "regime": regime}
 
 
 # ────────────────────────────── Pine Seeds output ──────────────────────────────
@@ -307,9 +338,28 @@ def main() -> None:
     paste = " ".join(parts)
     (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
 
+    # Dagelijkse historie-snapshot (t.b.v. vergelijking met eerdere sessies)
+    hist_dir = Path(__file__).parent / "history"
+    hist_dir.mkdir(exist_ok=True)
+    snapshot = {
+        "date": today.isoformat(),
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "underlying": UNDERLYING, "spot": round(spot, 2),
+        "regime": res["regime"], "net_total_gex": round(res["net_total"], 0),
+        "levels": {"gamma_flip": f.get("flip"), "call_wall": f.get("call_wall"),
+                   "put_wall": f.get("put_wall"), "gamma_levels": gl,
+                   "0dte": {"flip": d0.get("flip"), "call_wall": d0.get("call_wall"),
+                            "put_wall": d0.get("put_wall")},
+                   "session": ses, "correlated": cgl},
+        "net_per_strike": {f"{k:g}": v for k, v in sorted(res.get("net", {}).items())},
+    }
+    (hist_dir / f"{pfx}_{today.isoformat()}.json").write_text(json.dumps(snapshot, indent=1))
+
+    print(f"\n→ Dealer-regime: {res['regime']}  |  netto GEX ≈ ${res['net_total'] / 1e9:,.2f} mld per 1%-move")
     print("\n=== PASTE STRING ===")
     print(paste)
     print("\n✓ CSV's geschreven naar ./data — klaar voor Pine Seeds sync")
+    print("✓ Historie-snapshot geschreven naar ./history")
 
 
 if __name__ == "__main__":
