@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GexLevels GEX-pijplijn — gratis (CBOE) of betaald (Polygon)
+GexLevels GEX-pijplijn — gratis CBOE-data
 ────────────────────────────────────────────────────────────────
 Haalt de optieketen op, berekent per strike de dealer gamma-exposure en
 destilleert daaruit alle GexLevels-niveaus:
@@ -12,11 +12,9 @@ destilleert daaruit alle GexLevels-niveaus:
   • Γ-1 … Γ-10            (gerangschikte overige gamma-concentraties)
   • Correlated 1 … 10     (zelfde berekening op bv. SPY)
 
-Databronnen:
-  DATA_SOURCE=cboe     (default) — gratis, ~15 min delayed, geen key nodig
-                        endpoint: cdn.cboe.com/api/global/delayed_quotes/options/<TICKER>.json
-                        (indexen met underscore: _SPX, _NDX, _VIX)
-  DATA_SOURCE=polygon  — realtime, vereist POLYGON_API_KEY (Options-abonnement)
+Databron: CBOE delayed quotes — gratis, ~15 min vertraagd, geen key nodig.
+  endpoint: cdn.cboe.com/api/global/delayed_quotes/options/<TICKER>.json
+  (indexen met underscore: _SPX, _NDX, _VIX)
 
 Let op: open interest wordt hoe dan ook maar 1× per dag bijgewerkt (OCC),
 dus voor GEX-levels is de gratis delayed feed functioneel vrijwel gelijkwaardig.
@@ -26,8 +24,6 @@ Output:
   2. paste_string.txt  → kant-en-klare bulk-paste string (fallback voor de indicator)
 
 Omgevingsvariabelen:
-  DATA_SOURCE       cboe | polygon        (default: cboe)
-  POLYGON_API_KEY   alleen bij polygon
   UNDERLYING        default: QQQ
   CORRELATED        default: SPY
   STRIKE_RANGE_PCT  default: 0.15   (strikes binnen ±15% van spot)
@@ -50,8 +46,6 @@ import requests
 
 CALC_VERSION = "1.2.0"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
-DATA_SOURCE = os.environ.get("DATA_SOURCE", "cboe").lower()
-API_KEY     = os.environ.get("POLYGON_API_KEY", "")
 UNDERLYING  = os.environ.get("UNDERLYING", "QQQ")
 CORRELATED  = os.environ.get("CORRELATED", "SPY")          # komma-gescheiden lijst mogelijk, bv. "SPY,IWM"
 CORR_LIST   = [s.strip() for s in CORRELATED.split(",") if s.strip()]
@@ -107,52 +101,8 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float]:
     return out, spot
 
 
-# ────────────────────────────── Bron 2: Polygon (betaald) ──────────────────────────────
-
-def fetch_polygon(ticker: str) -> tuple[list[dict], float]:
-    if not API_KEY:
-        sys.exit("FOUT: DATA_SOURCE=polygon vereist POLYGON_API_KEY")
-    base = "https://api.polygon.io"
-    results: list[dict] = []
-    spot = float("nan")
-    url = f"{base}/v3/snapshot/options/{ticker}"
-    params = {"limit": 250, "apiKey": API_KEY}
-    while url:
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code == 429:
-            time.sleep(2)
-            continue
-        r.raise_for_status()
-        payload = r.json()
-        for c in payload.get("results", []):
-            det, greeks = c.get("details") or {}, c.get("greeks") or {}
-            k, gamma = det.get("strike_price"), greeks.get("gamma")
-            oi, typ = c.get("open_interest") or 0, det.get("contract_type")
-            exp_s = det.get("expiration_date")
-            if math.isnan(spot):
-                p = (c.get("underlying_asset") or {}).get("price")
-                if p:
-                    spot = float(p)
-            if k is None or gamma is None or not oi or typ not in ("call", "put") or not exp_s:
-                continue
-            results.append({"strike": float(k), "type": typ,
-                            "exp": dt.date.fromisoformat(exp_s),
-                            "gamma": float(gamma), "oi": float(oi),
-                            "iv": c.get("implied_volatility"),
-                            "vol": float((c.get("day") or {}).get("volume") or 0),
-                            "bid": float((c.get("last_quote") or {}).get("bid") or 0),
-                            "ask": float((c.get("last_quote") or {}).get("ask") or 0)})
-        url = payload.get("next_url")
-        params = {"apiKey": API_KEY}
-    if math.isnan(spot):
-        r = requests.get(f"{base}/v2/last/trade/{ticker}", params={"apiKey": API_KEY}, timeout=30)
-        r.raise_for_status()
-        spot = float(r.json()["results"]["p"])
-    return results, spot
-
-
 def fetch_chain(ticker: str) -> tuple[list[dict], float]:
-    return fetch_polygon(ticker) if DATA_SOURCE == "polygon" else fetch_cboe(ticker)
+    return fetch_cboe(ticker)
 
 
 # ────────────────────────────── GEX-berekening ──────────────────────────────
@@ -246,6 +196,30 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
             "profile": profile, "em_expiration": nearest_exp.isoformat() if nearest_exp else None}
 
 
+# ────────────────────────────── Live-script generator ──────────────────────────────
+
+def emit_live_script(paste: str, today: dt.date) -> bool:
+    """Schrijft data/GexLevels_live.pine: het volledige indicator-script met de
+    verse paste-string en datum al ingevuld — klaar om integraal te plakken."""
+    tpl_path = Path(__file__).parent / "GexLevels.pine"
+    if not tpl_path.exists():
+        return False
+    src = tpl_path.read_text()
+    out, done_p = [], False
+    for line in src.splitlines():
+        if not done_p and line.strip().startswith("pasteCode"):
+            line = f'pasteCode = "{paste}"   // {today.isoformat()}'
+            done_p = True
+        out.append(line)
+    if not done_p:
+        return False
+    dest_dir = Path(__file__).parent / "data"
+    dest_dir.mkdir(exist_ok=True)
+    dest = dest_dir / "GexLevels_live.pine"
+    dest.write_text("\n".join(out) + "\n")
+    return True
+
+
 # ────────────────────────────── Gamma-clusters & migratie ──────────────────────────────
 
 def find_clusters(net: dict[float, float], top_n: int = 8) -> list[dict]:
@@ -337,7 +311,7 @@ def main() -> None:
     version = float(today.strftime("%Y%m%d"))
     pfx = UNDERLYING.upper().lstrip("_")
 
-    print(f"→ Bron: {DATA_SOURCE}")
+    print("→ Bron: CBOE (delayed)")
     print(f"→ Ophalen {UNDERLYING} keten…")
     chain, spot = fetch_chain(UNDERLYING)
     res = compute_gex(chain, spot, today)
@@ -439,7 +413,7 @@ def main() -> None:
         "date": today.isoformat(),
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "underlying": UNDERLYING, "spot": round(spot, 2),
-        "data_source": DATA_SOURCE.upper(),
+        "data_source": "CBOE",
         "calculation_version": CALC_VERSION,
         "expiration_used": res.get("em_expiration"),
         "strike_range_pct": RANGE_PCT, "max_dte": MAX_DTE,
@@ -481,6 +455,8 @@ def main() -> None:
     print(f"\n→ Dealer-regime: {res['regime']}  |  netto GEX ≈ ${res['net_total'] / 1e9:,.2f} mld per 1%-move")
     print("\n=== PASTE STRING ===")
     print(paste)
+    if emit_live_script(paste, today):
+        print("✓ Kant-en-klaar script: ./data/GexLevels_live.pine")
     print("\n✓ CSV's geschreven naar ./data — klaar voor Pine Seeds sync")
     print("✓ Historie-snapshot geschreven naar ./history")
 
