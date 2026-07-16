@@ -95,7 +95,8 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float]:
             continue
         out.append({"strike": strike, "type": typ, "exp": exp,
                     "gamma": float(gamma), "oi": float(oi),
-                    "iv": float(iv) if iv else None})
+                    "iv": float(iv) if iv else None,
+                    "vol": float(o.get("volume") or 0)})
     if not spot:
         sys.exit(f"FOUT: geen spotprijs in CBOE-respons voor {ticker}")
     return out, spot
@@ -132,7 +133,8 @@ def fetch_polygon(ticker: str) -> tuple[list[dict], float]:
             results.append({"strike": float(k), "type": typ,
                             "exp": dt.date.fromisoformat(exp_s),
                             "gamma": float(gamma), "oi": float(oi),
-                            "iv": c.get("implied_volatility")})
+                            "iv": c.get("implied_volatility"),
+                            "vol": float((c.get("day") or {}).get("volume") or 0)})
         url = payload.get("next_url")
         params = {"apiKey": API_KEY}
     if math.isnan(spot):
@@ -151,6 +153,7 @@ def fetch_chain(ticker: str) -> tuple[list[dict], float]:
 def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
     per_strike: dict[float, dict] = defaultdict(lambda: {"call": 0.0, "put": 0.0})
     per_strike_0dte: dict[float, dict] = defaultdict(lambda: {"call": 0.0, "put": 0.0})
+    vol_map: dict[float, float] = {}
     atm_ivs: list[float] = []
 
     lo, hi = spot * (1 - RANGE_PCT), spot * (1 + RANGE_PCT)
@@ -162,6 +165,7 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
             continue
         gex = c["gamma"] * c["oi"] * 100 * spot     # $-gamma per 1%-move
         per_strike[k][c["type"]] += gex
+        vol_map[k] = vol_map.get(k, 0.0) + c.get("vol", 0.0)
         if exp == today:
             per_strike_0dte[k][c["type"]] += gex
         if c["iv"] and abs(k - spot) / spot <= 0.01 and (exp - today).days <= 5:
@@ -193,7 +197,8 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
     daily_move = spot * iv * math.sqrt(1 / 252) if iv else 0.0
     session = {"ceiling": round(spot + daily_move, 2), "floor": round(spot - daily_move, 2)} if daily_move else {}
 
-    return {"spot": spot, "full": full, "0dte": dte0, "session": session}
+    net_full = {k: round(v["call"] - v["put"], 2) for k, v in per_strike.items()}
+    return {"spot": spot, "full": full, "0dte": dte0, "session": session, "net": net_full, "vol": vol_map}
 
 
 # ────────────────────────────── Pine Seeds output ──────────────────────────────
@@ -257,6 +262,48 @@ def main() -> None:
         add(f"G{i}", k)
     for i, k in enumerate(cgl[:10], 1):
         add(f"C{i}", k)
+    # ── Tier-systeem [+] [++] [+++]: confluentie-score per strike ──
+    # Basis (kandidaat): |netto GEX| ≥ 35% van het maximum.
+    # +1 punt per onafhankelijke bevestiging:
+    #   • strike is óók prominent in de 0DTE-keten (walls/flip/top-ranked)
+    #   • strike ligt vlak bij een omgerekend correlated (SPY) kernlevel
+    #   • optievolume op de strike ≥ 60% van het maximale strike-volume
+    net = res.get("net", {})
+    if net:
+        mx = max(abs(v) for v in net.values()) or 1.0
+
+        dte0_set = set()
+        d0d = res["0dte"]
+        for kk in [d0d.get("call_wall"), d0d.get("put_wall"), d0d.get("flip")]:
+            if kk is not None:
+                dte0_set.add(kk)
+        dte0_set.update(d0d.get("gamma_levels", [])[:5])
+
+        # correlated strikes omrekenen naar hoofd-symbool-schaal via spot-ratio
+        ratio = res["spot"] / cres["spot"] if cres.get("spot") else None
+        corr_conv = [k * ratio for k in cgl if k] if ratio else []
+        tol = res["spot"] * 0.0025   # ±0,25% telt als alignment
+
+        vol_map = res.get("vol", {})
+        vmax = max(vol_map.values()) if vol_map else 0.0
+
+        marks = []
+        for k, v in sorted(net.items(), key=lambda kv: -abs(kv[1])):
+            if abs(v) / mx < 0.35:
+                continue
+            score = 1
+            if any(abs(k - z) < 0.01 for z in dte0_set):
+                score += 1
+            if any(abs(k - z) <= tol for z in corr_conv):
+                score += 1
+            if vmax and vol_map.get(k, 0.0) >= 0.60 * vmax:
+                score += 1
+            marks.append(f"{k:g}" + "+" * min(score, 3))
+            if len(marks) >= 12:
+                break
+        if marks:
+            parts.append("MK:" + "|".join(marks))
+
     paste = " ".join(parts)
     (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
 
