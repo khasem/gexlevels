@@ -1,0 +1,47 @@
+# Plaats dit bestand in je repo als: .github/workflows/update-levels.yml
+#
+# Draait elke 30 min tijdens US-markturen (13:00–21:00 UTC, ma–vr),
+# berekent de GEX-levels en commit de Pine Seeds CSV's + paste_string.txt.
+#
+# Standaard: GRATIS CBOE delayed data — geen API-key of secret nodig.
+# Optioneel realtime via Polygon: zet DATA_SOURCE op "polygon" en voeg het
+# repo-secret POLYGON_API_KEY toe (Settings → Secrets → Actions).
+
+name: Update GEX levels
+
+on:
+  schedule:
+    - cron: "*/30 13-21 * * 1-5"
+  workflow_dispatch: {}        # handmatig triggeren kan ook
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Compute GEX levels
+        env:
+          DATA_SOURCE: cboe                # of: polygon
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}   # alleen nodig bij polygon
+          UNDERLYING: QQQ
+          CORRELATED: SPY
+        run: python gex_pipeline.py
+
+      - name: Commit & push
+        run: |
+          git config user.name  "gex-bot"
+          git config user.email "gex-bot@users.noreply.github.com"
+          git add data/ paste_string.txt
+          git diff --cached --quiet || git commit -m "GEX levels $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
