@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-GexSuite-stijl GEX-pijplijn — gratis (CBOE) of betaald (Polygon)
+GexLevels GEX-pijplijn — gratis (CBOE) of betaald (Polygon)
 ────────────────────────────────────────────────────────────────
 Haalt de optieketen op, berekent per strike de dealer gamma-exposure en
-destilleert daaruit alle GexSuite-levels:
+destilleert daaruit alle GexLevels-niveaus:
 
   • Gamma Flip            (nul-doorgang van cumulatieve netto GEX)
   • Call Wall / Put Wall  (grootste call- resp. put-side gamma-concentratie)
