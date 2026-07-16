@@ -48,12 +48,13 @@ from pathlib import Path
 
 import requests
 
-CALC_VERSION = "1.1.0"
+CALC_VERSION = "1.2.0"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "cboe").lower()
 API_KEY     = os.environ.get("POLYGON_API_KEY", "")
 UNDERLYING  = os.environ.get("UNDERLYING", "QQQ")
-CORRELATED  = os.environ.get("CORRELATED", "SPY")
+CORRELATED  = os.environ.get("CORRELATED", "SPY")          # komma-gescheiden lijst mogelijk, bv. "SPY,IWM"
+CORR_LIST   = [s.strip() for s in CORRELATED.split(",") if s.strip()]
 RANGE_PCT   = float(os.environ.get("STRIKE_RANGE_PCT", "0.15"))
 MAX_DTE     = int(os.environ.get("MAX_DTE", "60"))
 
@@ -206,7 +207,16 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
         flip = round(min(crossings, key=lambda x: abs(x - spot)), 2) if crossings else min(ks, key=lambda k: abs(k - spot))
         rest = [k for k in ks if k not in (call_wall, put_wall)]
         ranked = sorted(rest, key=lambda k: abs(net[k]), reverse=True)[:10]
-        return {"flip": flip, "call_wall": call_wall, "put_wall": put_wall, "gamma_levels": ranked}
+        # Secondary walls: op-één-na-grootste concentratie, buiten de directe buurt van de primary
+        gaps = [b - a for a, b in zip(ks, ks[1:]) if b - a > 0]
+        step = sorted(gaps)[len(gaps) // 2] if gaps else 1.0
+        def _secondary(side: str, primary: float):
+            for k in sorted(ks, key=lambda kk: strikes[kk][side], reverse=True):
+                if abs(k - primary) > step * 2:
+                    return k
+            return None
+        return {"flip": flip, "call_wall": call_wall, "put_wall": put_wall, "gamma_levels": ranked,
+                "call_wall_2": _secondary("call", call_wall), "put_wall_2": _secondary("put", put_wall)}
 
     full, dte0 = derive(per_strike), derive(per_strike_0dte)
 
@@ -234,6 +244,70 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
     return {"spot": spot, "full": full, "0dte": dte0, "session": session,
             "net": net_full, "vol": vol_map, "net_total": net_total, "regime": regime,
             "profile": profile, "em_expiration": nearest_exp.isoformat() if nearest_exp else None}
+
+
+# ────────────────────────────── Gamma-clusters & migratie ──────────────────────────────
+
+def find_clusters(net: dict[float, float], top_n: int = 8) -> list[dict]:
+    """Groepeert aangrenzende, significante strikes met gelijk teken tot gamma-clusters.
+
+    Significantie: |netto GEX| ≥ 25% van het maximum. Aangrenzend: gat ≤ 1,5× strike-stap.
+    Sterkte is relatief t.o.v. het zwaarste cluster (100%)."""
+    if not net:
+        return []
+    ks = sorted(net)
+    gaps = [b - a for a, b in zip(ks, ks[1:]) if b - a > 0]
+    step = sorted(gaps)[len(gaps) // 2] if gaps else 1.0
+    mx = max(abs(v) for v in net.values()) or 1.0
+    sig = [k for k in ks if abs(net[k]) >= 0.25 * mx]
+
+    groups, cur = [], []
+    for k in sig:
+        if cur and (k - cur[-1] > step * 1.5 or (net[k] > 0) != (net[cur[-1]] > 0)):
+            groups.append(cur)
+            cur = []
+        cur.append(k)
+    if cur:
+        groups.append(cur)
+
+    out = []
+    for c in groups:
+        tot = sum(abs(net[k]) for k in c)
+        center = sum(k * abs(net[k]) for k in c) / tot
+        out.append({"lo": c[0], "hi": c[-1], "width": len(c), "center": round(center, 2),
+                    "sign": "call" if net[max(c, key=lambda k: abs(net[k]))] > 0 else "put",
+                    "total_gex": round(tot, 0)})
+    if out:
+        mxt = max(o["total_gex"] for o in out)
+        for o in out:
+            o["strength_pct"] = round(100 * o["total_gex"] / mxt, 1)
+    out.sort(key=lambda o: -o["total_gex"])
+    return out[:top_n]
+
+
+def compute_migration(hist_dir: Path, pfx: str, today: dt.date, snapshot: dict):
+    """Vergelijkt de huidige positionering met het meest recente eerdere snapshot."""
+    prev_files = sorted(f for f in hist_dir.glob(f"{pfx}_*.json")
+                        if f.stem.split("_", 1)[1] < today.isoformat())
+    if not prev_files:
+        return None
+    prev = json.loads(prev_files[-1].read_text())
+
+    def diff(now, old):
+        if now is None or old is None:
+            return None
+        return {"prev": old, "now": now, "delta": round(now - old, 2)}
+
+    pl, nl = prev.get("levels", {}), snapshot["levels"]
+    return {
+        "vs_date": prev.get("date"),
+        "spot": diff(snapshot["spot"], prev.get("spot")),
+        "net_total_gex": diff(snapshot["net_total_gex"], prev.get("net_total_gex")),
+        "regime_changed": prev.get("regime") != snapshot.get("regime"),
+        "gamma_flip": diff(nl.get("gamma_flip"), pl.get("gamma_flip")),
+        "call_wall": diff(nl.get("call_wall"), pl.get("call_wall")),
+        "put_wall": diff(nl.get("put_wall"), pl.get("put_wall")),
+    }
 
 
 # ────────────────────────────── Pine Seeds output ──────────────────────────────
@@ -269,10 +343,13 @@ def main() -> None:
     res = compute_gex(chain, spot, today)
     print(f"   spot={spot:.2f}, contracten={len(chain)}")
 
-    print(f"→ Ophalen {CORRELATED} keten…")
-    cchain, cspot = fetch_chain(CORRELATED)
-    cres = compute_gex(cchain, cspot, today)
-    print(f"   spot={cspot:.2f}, contracten={len(cchain)}")
+    corr_results = []
+    for csym in CORR_LIST:
+        print(f"→ Ophalen {csym} keten…")
+        cchain, cspot = fetch_chain(csym)
+        corr_results.append((csym, compute_gex(cchain, cspot, today)))
+        print(f"   spot={cspot:.2f}, contracten={len(cchain)}")
+    cres = corr_results[0][1]   # eerste correlated asset voedt de λ-levels op de chart
 
     f, d0, ses = res["full"], res["0dte"], res["session"]
     gl  = f.get("gamma_levels", [])
@@ -314,10 +391,21 @@ def main() -> None:
                 dte0_set.add(kk)
         dte0_set.update(d0d.get("gamma_levels", [])[:5])
 
-        # correlated strikes omrekenen naar hoofd-symbool-schaal via spot-ratio
-        ratio = res["spot"] / cres["spot"] if cres.get("spot") else None
-        corr_conv = [k * ratio for k in cgl if k] if ratio else []
+        # correlated kernlevels van ALLE opgegeven assets omrekenen via spot-ratio
+        corr_conv = []
+        for _csym, _cr in corr_results:
+            if not _cr.get("spot"):
+                continue
+            _ratio = res["spot"] / _cr["spot"]
+            _cf = _cr["full"]
+            _keys = ([_cf.get("call_wall"), _cf.get("put_wall"), _cf.get("flip")]
+                     + _cf.get("gamma_levels", [])[:5])
+            corr_conv.extend(k * _ratio for k in _keys if k)
         tol = res["spot"] * 0.0025   # ±0,25% telt als alignment
+
+        # sterke multi-strike clusters (voor cluster-lidmaatschap in de score)
+        clusters = find_clusters(res.get("net", {}))
+        strong_clusters = [c for c in clusters if c["strength_pct"] >= 50 and c["width"] >= 2]
 
         vol_map = res.get("vol", {})
         vmax = max(vol_map.values()) if vol_map else 0.0
@@ -332,6 +420,8 @@ def main() -> None:
             if any(abs(k - z) <= tol for z in corr_conv):
                 score += 1
             if vmax and vol_map.get(k, 0.0) >= 0.60 * vmax:
+                score += 1
+            if any(c["lo"] <= k <= c["hi"] for c in strong_clusters):
                 score += 1
             marks.append(f"{k:g}" + "+" * min(score, 3))
             if len(marks) >= 12:
@@ -354,14 +444,39 @@ def main() -> None:
         "expiration_used": res.get("em_expiration"),
         "strike_range_pct": RANGE_PCT, "max_dte": MAX_DTE,
         "regime": res["regime"], "net_total_gex": round(res["net_total"], 0),
+        "correlated_symbols": CORR_LIST,
         "levels": {"gamma_flip": f.get("flip"), "call_wall": f.get("call_wall"),
-                   "put_wall": f.get("put_wall"), "gamma_levels": gl,
+                   "put_wall": f.get("put_wall"),
+                   "call_wall_secondary": f.get("call_wall_2"),
+                   "put_wall_secondary": f.get("put_wall_2"),
+                   "gamma_levels": gl,
                    "0dte": {"flip": d0.get("flip"), "call_wall": d0.get("call_wall"),
                             "put_wall": d0.get("put_wall")},
                    "session": ses, "correlated": cgl},
+        "clusters": find_clusters(res.get("net", {})),
         "gamma_profile": {f"{k:g}": v for k, v in sorted(res.get("profile", {}).items())},
     }
+    snapshot["migration"] = compute_migration(hist_dir, pfx, today, snapshot)
     (hist_dir / f"{pfx}_{today.isoformat()}.json").write_text(json.dumps(snapshot, indent=1))
+
+    # Console-samenvatting: clusters + migratie
+    top_c = snapshot["clusters"][:3]
+    if top_c:
+        print("\n→ Gamma-clusters (top 3):")
+        for c in top_c:
+            print(f"   {c['sign']:<4} {c['lo']:g}–{c['hi']:g}  center {c['center']:g}  sterkte {c['strength_pct']:g}%")
+    mig = snapshot["migration"]
+    if mig:
+        print(f"\n→ Gamma Migration t.o.v. {mig['vs_date']}:")
+        for naam, key in [("Gamma Flip", "gamma_flip"), ("Call Wall", "call_wall"), ("Put Wall", "put_wall")]:
+            d = mig.get(key)
+            if d:
+                print(f"   {naam}: {d['prev']:g} → {d['now']:g}  ({d['delta']:+g})")
+        dn = mig.get("net_total_gex")
+        if dn:
+            print(f"   Netto GEX: ${dn['prev'] / 1e9:,.2f} mld → ${dn['now'] / 1e9:,.2f} mld")
+        if mig.get("regime_changed"):
+            print("   ⚠ REGIME-WISSEL sinds vorige sessie!")
 
     print(f"\n→ Dealer-regime: {res['regime']}  |  netto GEX ≈ ${res['net_total'] / 1e9:,.2f} mld per 1%-move")
     print("\n=== PASTE STRING ===")
