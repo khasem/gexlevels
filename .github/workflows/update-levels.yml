@@ -1,11 +1,11 @@
 # Plaats dit bestand in je repo als: .github/workflows/update-levels.yml
 #
-# Draait elke 30 min tijdens US-markturen (13:00–21:00 UTC, ma–vr),
-# berekent de GEX-levels en commit de Pine Seeds CSV's + paste_string.txt.
+# Draait elke 30 min tijdens US-markturen (ma–vr), berekent de GEX-levels en
+# commit de Pine Seeds CSV's + paste_string.txt + historie-snapshots.
 #
-# Standaard: GRATIS CBOE delayed data — geen API-key of secret nodig.
-# Optioneel realtime via Polygon: zet DATA_SOURCE op "polygon" en voeg het
-# repo-secret POLYGON_API_KEY toe (Settings → Secrets → Actions).
+# Databron: gratis CBOE delayed data — geen API-key of secret nodig.
+# Let op: de cron-tijden zijn UTC en afgestemd op US-zomertijd; in de winter
+# schuift de US-sessie één uur op (14:30–21:00 UTC).
 
 name: Update GEX levels
 
@@ -17,6 +17,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: update-gex-levels
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -33,10 +37,11 @@ jobs:
 
       - name: Compute GEX levels
         env:
-          DATA_SOURCE: cboe                # of: polygon
-          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}   # alleen nodig bij polygon
           UNDERLYING: QQQ
           CORRELATED: SPY
+          FLIP_METHOD: profile     # of: cumulative (oude methode)
+          GAMMA_RANK: total        # of: net (oude methode)
+          SPOT_DELAY_MIN: "15"     # CBOE delayed-feed correctie voor het TS-anker
         run: python gex_pipeline.py
 
       - name: Commit & push
@@ -45,4 +50,5 @@ jobs:
           git config user.email "gex-bot@users.noreply.github.com"
           git add data/ paste_string.txt history/
           git diff --cached --quiet || git commit -m "GEX levels $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
           git push
