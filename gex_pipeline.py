@@ -5,7 +5,9 @@ GexLevels GEX-pijplijn — gratis CBOE-data
 Haalt de optieketen op, berekent per strike de dealer gamma-exposure en
 destilleert daaruit alle GexLevels-niveaus:
 
-  • Gamma Flip            (nul-doorgang van cumulatieve netto GEX)
+  • Gamma Flip            (profielmethode: tekenwissel van totale dealer-gamma
+                           over hypothetische spots; FLIP_METHOD=cumulative voor
+                           de oude nul-doorgang van cumulatieve netto GEX)
   • Call Wall / Put Wall  (grootste call- resp. put-side gamma-concentratie)
   • 0DTE-varianten        (alleen contracten die vandaag expireren)
   • Session Ceiling/Floor (verwachte dagrange uit ATM implied volatility)
@@ -25,9 +27,14 @@ Output:
 
 Omgevingsvariabelen:
   UNDERLYING        default: QQQ
-  CORRELATED        default: SPY
+  CORRELATED        default: SPY    (komma-gescheiden lijst mogelijk)
   STRIKE_RANGE_PCT  default: 0.15   (strikes binnen ±15% van spot)
   MAX_DTE           default: 60     (expiraties tot 60 dagen vooruit)
+  FLIP_METHOD       default: profile     (of: cumulative)
+  GAMMA_RANK        default: total       (of: net)
+  EM_FACTOR         default: 0.85        (expected-move-fractie van de ATM-straddle)
+  SPOT_DELAY_MIN    default: 15          (feedvertraging-correctie voor het TS-anker)
+  DATA_SOURCE       default: cboe        (enige ondersteunde bron)
 """
 
 from __future__ import annotations
@@ -105,6 +112,9 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float]:
 
 
 def fetch_chain(ticker: str) -> tuple[list[dict], float]:
+    src = os.environ.get("DATA_SOURCE", "cboe").lower()
+    if src != "cboe":
+        sys.exit(f"FOUT: DATA_SOURCE '{src}' wordt niet ondersteund — alleen 'cboe' is geïmplementeerd.")
     return fetch_cboe(ticker)
 
 
@@ -424,6 +434,7 @@ def main() -> None:
     #   • strike ligt vlak bij een omgerekend correlated (SPY) kernlevel
     #   • optievolume op de strike ≥ 60% van het maximale strike-volume
     net = res.get("net", {})
+    clusters: list[dict] = []
     if net:
         mx = max(abs(v) for v in net.values()) or 1.0
 
@@ -446,8 +457,9 @@ def main() -> None:
             corr_conv.extend(k * _ratio for k in _keys if k)
         tol = res["spot"] * 0.0025   # ±0,25% telt als alignment
 
-        # sterke multi-strike clusters (voor cluster-lidmaatschap in de score)
-        clusters = find_clusters(res.get("net", {}))
+        # sterke multi-strike clusters (voor cluster-lidmaatschap in de score;
+        # dezelfde lijst wordt verderop hergebruikt voor het historie-snapshot)
+        clusters = find_clusters(net)
         strong_clusters = [c for c in clusters if c["strength_pct"] >= 50 and c["width"] >= 2]
 
         vol_map = res.get("vol", {})
@@ -508,7 +520,7 @@ def main() -> None:
                    "0dte": {"flip": d0.get("flip"), "call_wall": d0.get("call_wall"),
                             "put_wall": d0.get("put_wall")},
                    "session": ses, "correlated": cgl},
-        "clusters": find_clusters(res.get("net", {})),
+        "clusters": clusters,
         "gamma_profile": {f"{k:g}": v for k, v in sorted(res.get("profile", {}).items())},
     }
     snapshot["migration"] = compute_migration(hist_dir, pfx, today, snapshot)
