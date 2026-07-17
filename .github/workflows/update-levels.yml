@@ -11,7 +11,8 @@ name: Update GEX levels
 
 on:
   schedule:
-    - cron: "*/30 13-21 * * 1-5"
+    - cron: "*/30 13-21 * * 1-5"   # 15:00-23:00 NL (zomertijd): US-sessie
+    - cron: "0 4,5,6,7 * * 1-5"    # 06:00-09:00 NL (zomertijd): ochtend-refresh, nieuwe dag-OI + verse 0DTE
   workflow_dispatch: {}        # handmatig triggeren kan ook
 
 permissions:
