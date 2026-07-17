@@ -403,6 +403,12 @@ def main() -> None:
         if marks:
             parts.append("MK:" + "|".join(marks))
 
+    # Spot-ankers: hiermee verankert de indicator de strike→chart-conversie
+    # op het paste-moment (robuust bij overnight gaps en daily-bar-mismatch)
+    parts.append(f"SPOT:{spot:.2f}")
+    if corr_results and corr_results[0][1].get("spot"):
+        parts.append(f"CSPOT:{corr_results[0][1]['spot']:.2f}")
+
     paste = " ".join(parts)
     (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
 
