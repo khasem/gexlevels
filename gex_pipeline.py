@@ -44,9 +44,10 @@ from pathlib import Path
 
 import requests
 
-CALC_VERSION = "1.3.0"
+CALC_VERSION = "1.3.1"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
 FLIP_METHOD = os.environ.get("FLIP_METHOD", "profile")     # "profile" (gamma-profiel vs spot) of "cumulative" (oude methode)
+GAMMA_RANK  = os.environ.get("GAMMA_RANK", "total")        # "total" (call+put gamma) of "net" (|call−put|, oude methode)
 UNDERLYING  = os.environ.get("UNDERLYING", "QQQ")
 CORRELATED  = os.environ.get("CORRELATED", "SPY")          # komma-gescheiden lijst mogelijk, bv. "SPY,IWM"
 CORR_LIST   = [s.strip() for s in CORRELATED.split(",") if s.strip()]
@@ -205,7 +206,13 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
             prev_cum, prev_k = cum, k
         flip = round(min(crossings, key=lambda x: abs(x - spot)), 2) if crossings else min(ks, key=lambda k: abs(k - spot))
         rest = [k for k in ks if k not in (call_wall, put_wall)]
-        ranked = sorted(rest, key=lambda k: abs(net[k]), reverse=True)[:10]
+        # Γ-ranking: "total" = call+put gamma (strikes met grote posities aan
+        # béíde kanten blijven zichtbaar — bij netto vallen die tegen elkaar weg),
+        # "net" = |call−put| (oude methode)
+        if GAMMA_RANK == "total":
+            ranked = sorted(rest, key=lambda k: strikes[k]["call"] + strikes[k]["put"], reverse=True)[:10]
+        else:
+            ranked = sorted(rest, key=lambda k: abs(net[k]), reverse=True)[:10]
         # Secondary walls: op-één-na-grootste concentratie, buiten de directe buurt van de primary
         gaps = [b - a for a, b in zip(ks, ks[1:]) if b - a > 0]
         step = sorted(gaps)[len(gaps) // 2] if gaps else 1.0
@@ -488,6 +495,7 @@ def main() -> None:
         "data_source": "CBOE",
         "calculation_version": CALC_VERSION,
         "flip_method": res.get("flip_method"),
+        "gamma_rank": GAMMA_RANK,
         "expiration_used": res.get("em_expiration"),
         "strike_range_pct": RANGE_PCT, "max_dte": MAX_DTE,
         "regime": res["regime"], "net_total_gex": round(res["net_total"], 0),
