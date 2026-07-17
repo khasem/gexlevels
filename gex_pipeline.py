@@ -44,13 +44,15 @@ from pathlib import Path
 
 import requests
 
-CALC_VERSION = "1.2.0"
+CALC_VERSION = "1.3.0"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
+FLIP_METHOD = os.environ.get("FLIP_METHOD", "profile")     # "profile" (gamma-profiel vs spot) of "cumulative" (oude methode)
 UNDERLYING  = os.environ.get("UNDERLYING", "QQQ")
 CORRELATED  = os.environ.get("CORRELATED", "SPY")          # komma-gescheiden lijst mogelijk, bv. "SPY,IWM"
 CORR_LIST   = [s.strip() for s in CORRELATED.split(",") if s.strip()]
 RANGE_PCT   = float(os.environ.get("STRIKE_RANGE_PCT", "0.15"))
 MAX_DTE     = int(os.environ.get("MAX_DTE", "60"))
+SPOT_DELAY_MIN = float(os.environ.get("SPOT_DELAY_MIN", "15"))  # CBOE delayed ≈ 15 min
 
 DATA_DIR = Path(__file__).parent / "data"
 UA = {"User-Agent": "Mozilla/5.0 (gex-levels-pipeline; educational use)"}
@@ -107,9 +109,54 @@ def fetch_chain(ticker: str) -> tuple[list[dict], float]:
 
 # ────────────────────────────── GEX-berekening ──────────────────────────────
 
+def bs_gamma(S: float, K: float, T: float, iv: float) -> float:
+    """Black-Scholes gamma (r≈0, q≈0) — voldoende voor de tekenwissel van het profiel."""
+    if S <= 0 or K <= 0 or T <= 0 or iv <= 0:
+        return 0.0
+    st = iv * math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * iv * iv * T) / st
+    return math.exp(-0.5 * d1 * d1) / (math.sqrt(2 * math.pi) * S * st)
+
+
+def profile_flip(contracts: list[dict], lo: float, hi: float,
+                 today: dt.date, spot: float) -> float | None:
+    """Gamma Flip via het gamma-profiel: totale netto dealer-gamma herberekend op
+    hypothetische spotprijzen (gamma schuift mee met de onderliggende). De flip is
+    de spotprijs waar het totaal van teken wisselt — in een negatief regime ligt die
+    structureel bóven de markt ("boven X wordt dealer-gamma weer positief").
+    Dit is de methode die commerciële GEX-aanbieders doorgaans hanteren; de
+    cumulatief-over-strikes-methode blijft beschikbaar als fallback."""
+    def _iv(v: float) -> float:
+        return v / 100 if v > 3 else v          # CBOE geeft IV soms in %
+    legs = []
+    for c in contracts:
+        if not c.get("iv"):
+            continue
+        iv = _iv(float(c["iv"]))
+        if iv <= 0:
+            continue
+        T = (max((c["exp"] - today).days, 0) + 0.5) / 365.0   # +0,5 dag: 0DTE houdt intraday-gamma
+        legs.append((c["strike"], 1.0 if c["type"] == "call" else -1.0, c["oi"], iv, T))
+    if not legs:
+        return None
+    n = 240
+    prev_tot, prev_s, crossings = None, None, []
+    for i in range(n + 1):
+        s = lo + (hi - lo) * i / n
+        tot = sum(sign * oi * bs_gamma(s, k, t, iv) for k, sign, oi, iv, t in legs)
+        if prev_tot is not None and (prev_tot < 0 <= tot or prev_tot > 0 >= tot) and tot != prev_tot:
+            crossings.append(prev_s + (0 - prev_tot) / (tot - prev_tot) * (s - prev_s))
+        prev_tot, prev_s = tot, s
+    if not crossings:
+        return None
+    return round(min(crossings, key=lambda x: abs(x - spot)), 2)
+
+
 def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
     per_strike: dict[float, dict] = defaultdict(lambda: {"call": 0.0, "put": 0.0})
     per_strike_0dte: dict[float, dict] = defaultdict(lambda: {"call": 0.0, "put": 0.0})
+    filt: list[dict] = []          # gefilterde contracten (voor het flip-profiel)
+    filt0: list[dict] = []         # idem, alleen 0DTE
     vol_map: dict[float, float] = {}
     atm_ivs: list[float] = []
     straddle: dict[tuple, float] = {}          # (exp, strike, type) → mid-prijs
@@ -125,9 +172,11 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
         # Notionele GEX: gamma × OI × multiplier(100) × spot² × 1%  ($-gamma per 1%-move)
         gex = c["gamma"] * c["oi"] * 100 * spot * spot * 0.01
         per_strike[k][c["type"]] += gex
+        filt.append(c)
         vol_map[k] = vol_map.get(k, 0.0) + c.get("vol", 0.0)
         if exp == today:
             per_strike_0dte[k][c["type"]] += gex
+            filt0.append(c)
         if c["iv"] and abs(k - spot) / spot <= 0.01 and (exp - today).days <= 5:
             atm_ivs.append(float(c["iv"]))
         # ATM-straddle verzamelen (dichtstbijzijnde expiratie, strikes binnen 2% van spot)
@@ -170,6 +219,18 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
 
     full, dte0 = derive(per_strike), derive(per_strike_0dte)
 
+    # Gamma Flip vervangen door de profielmethode (tenzij FLIP_METHOD=cumulative
+    # of het profiel geen doorgang oplevert — dan blijft de cumulatieve flip staan)
+    flip_used = "cumulative"
+    if FLIP_METHOD == "profile":
+        pf = profile_flip(filt, lo, hi, today, spot)
+        if pf is not None and full:
+            full["flip"] = pf
+            flip_used = "profile"
+        pf0 = profile_flip(filt0, lo, hi, today, spot)
+        if pf0 is not None and dte0:
+            dte0["flip"] = pf0
+
     # Session Range — voorkeursmodel: expected move ≈ EM_FACTOR × ATM-straddle
     # van de dichtstbijzijnde expiratie (publieke standaardbenadering).
     daily_move = 0.0
@@ -193,7 +254,8 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
     regime = "POSITIEF (+GEX, mean-reversion)" if net_total > 0 else "NEGATIEF (-GEX, momentum)"
     return {"spot": spot, "full": full, "0dte": dte0, "session": session,
             "net": net_full, "vol": vol_map, "net_total": net_total, "regime": regime,
-            "profile": profile, "em_expiration": nearest_exp.isoformat() if nearest_exp else None}
+            "profile": profile, "em_expiration": nearest_exp.isoformat() if nearest_exp else None,
+            "flip_method": flip_used}
 
 
 # ────────────────────────────── Live-script generator ──────────────────────────────
@@ -403,11 +465,15 @@ def main() -> None:
         if marks:
             parts.append("MK:" + "|".join(marks))
 
-    # Spot-ankers: hiermee verankert de indicator de strike→chart-conversie
-    # op het paste-moment (robuust bij overnight gaps en daily-bar-mismatch)
+    # Spot-ankers: hiermee verankert de indicator de strike→chart-conversie.
+    # TS = het feitelijke meetmoment van de spot (nu − feedvertraging); de
+    # indicator zoekt de chartbar bij TS en berekent de ratio met close-van-toen,
+    # zodat de conversie klopt ongeacht wanneer de chart geladen wordt.
     parts.append(f"SPOT:{spot:.2f}")
     if corr_results and corr_results[0][1].get("spot"):
         parts.append(f"CSPOT:{corr_results[0][1]['spot']:.2f}")
+    ts = int(time.time() - SPOT_DELAY_MIN * 60)
+    parts.append(f"TS:{ts}")
 
     paste = " ".join(parts)
     (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
@@ -421,6 +487,7 @@ def main() -> None:
         "underlying": UNDERLYING, "spot": round(spot, 2),
         "data_source": "CBOE",
         "calculation_version": CALC_VERSION,
+        "flip_method": res.get("flip_method"),
         "expiration_used": res.get("em_expiration"),
         "strike_range_pct": RANGE_PCT, "max_dte": MAX_DTE,
         "regime": res["regime"], "net_total_gex": round(res["net_total"], 0),
@@ -459,6 +526,7 @@ def main() -> None:
             print("   ⚠ REGIME-WISSEL sinds vorige sessie!")
 
     print(f"\n→ Dealer-regime: {res['regime']}  |  netto GEX ≈ ${res['net_total'] / 1e9:,.2f} mld per 1%-move")
+    print(f"→ Gamma Flip-methode: {res.get('flip_method')}  |  flip = {f.get('flip')}")
     print("\n=== PASTE STRING ===")
     print(paste)
     if emit_live_script(paste, today):
