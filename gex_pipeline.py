@@ -518,6 +518,11 @@ def main() -> None:
     if corr_results and corr_results[0][1].get("spot"):
         parts.append(f"CSPOT:{corr_results[0][1]['spot']:.2f}")
     parts.append(f"TS:{ts}")
+    # DT = de datum (ET) waarop de optiedata is vastgelegd — de indicator toont
+    # dit rechtsboven, zodat op de chart zichtbaar is hoe vers de levels zijn
+    # (bv. in het weekend: vrijdagdata, net als bij vergelijkbare indicatoren).
+    from zoneinfo import ZoneInfo
+    parts.append("DT:" + dt.datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date().isoformat())
     print(f"→ TS-anker: {dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(timespec='seconds')} UTC  [{ts_src}]")
 
     paste = " ".join(parts)
