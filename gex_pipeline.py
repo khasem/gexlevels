@@ -295,9 +295,9 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
 
 # ────────────────────────────── Live-script generator ──────────────────────────────
 
-def emit_live_script(paste: str, today: dt.date) -> bool:
-    """Schrijft data/GexLevels_live.pine: het volledige indicator-script met de
-    verse paste-string en datum al ingevuld — klaar om integraal te plakken."""
+def emit_live_script(paste: str, today: dt.date, pfx: str) -> bool:
+    """Schrijft data/GexLevels_live_<PFX>.pine: het volledige indicator-script met
+    de verse paste-string en datum al ingevuld — klaar om integraal te plakken."""
     tpl_path = Path(__file__).parent / "GexLevels.pine"
     if not tpl_path.exists():
         return False
@@ -312,7 +312,7 @@ def emit_live_script(paste: str, today: dt.date) -> bool:
         return False
     dest_dir = Path(__file__).parent / "data"
     dest_dir.mkdir(exist_ok=True)
-    dest = dest_dir / "GexLevels_live.pine"
+    dest = dest_dir / f"GexLevels_live_{pfx}.pine"
     dest.write_text("\n".join(out) + "\n")
     return True
 
@@ -420,12 +420,13 @@ def main() -> None:
         cchain, cspot, _cts = fetch_chain(csym)
         corr_results.append((csym, compute_gex(cchain, cspot, today)))
         print(f"   spot={cspot:.2f}, contracten={len(cchain)}")
-    cres = corr_results[0][1]   # eerste correlated asset voedt de λ-levels op de chart
+    # eerste correlated asset voedt de λ-levels op de chart (optioneel)
+    cres = corr_results[0][1] if corr_results else None
 
     f, d0, ses = res["full"], res["0dte"], res["session"]
     gl  = f.get("gamma_levels", [])
     cgl = ([cres["full"].get("call_wall", 0), cres["full"].get("put_wall", 0), cres["full"].get("flip", 0)]
-           + cres["full"].get("gamma_levels", []))[:10]
+           + cres["full"].get("gamma_levels", []))[:10] if cres else []
 
     upsert_csv(f"{pfx}_CORE",  date_key, [f.get("flip", 0), f.get("call_wall", 0), f.get("put_wall", 0), d0.get("flip", 0), version])
     upsert_csv(f"{pfx}_INTRA", date_key, [d0.get("call_wall", 0), d0.get("put_wall", 0), ses.get("ceiling", 0), ses.get("floor", 0), version])
@@ -517,6 +518,11 @@ def main() -> None:
     parts.append(f"SPOT:{spot:.2f}")
     if corr_results and corr_results[0][1].get("spot"):
         parts.append(f"CSPOT:{corr_results[0][1]['spot']:.2f}")
+    # SYM/CSYM: het optiesymbool waar de strikes bij horen — de indicator neemt
+    # dit over in de labels (bv. "GLD 369.5" i.p.v. "QQQ …" op een goudchart)
+    parts.append(f"SYM:{pfx}")
+    if corr_results:
+        parts.append("CSYM:" + corr_results[0][0].upper().lstrip("_"))
     parts.append(f"TS:{ts}")
     # DT = de datum (ET) waarop de optiedata is vastgelegd — de indicator toont
     # dit rechtsboven, zodat op de chart zichtbaar is hoe vers de levels zijn
@@ -526,6 +532,9 @@ def main() -> None:
     print(f"→ TS-anker: {dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(timespec='seconds')} UTC  [{ts_src}]")
 
     paste = " ".join(parts)
+    # per underlying een eigen bestand (paste_string_QQQ.txt, paste_string_GLD.txt, …)
+    (Path(__file__).parent / f"paste_string_{pfx}.txt").write_text(paste + "\n")
+    # legacy-bestand blijft bestaan; bevat de laatst gedraaide underlying
     (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
 
     # Dagelijkse historie-snapshot (t.b.v. vergelijking met eerdere sessies)
@@ -581,8 +590,8 @@ def main() -> None:
     print(f"→ Gamma Flip-methode: {res.get('flip_method')}  |  flip = {f.get('flip')}")
     print("\n=== PASTE STRING ===")
     print(paste)
-    if emit_live_script(paste, today):
-        print("✓ Kant-en-klaar script: ./data/GexLevels_live.pine")
+    if emit_live_script(paste, today, pfx):
+        print(f"✓ Kant-en-klaar script: ./data/GexLevels_live_{pfx}.pine")
     print("\n✓ CSV's geschreven naar ./data — klaar voor Pine Seeds sync")
     print("✓ Historie-snapshot geschreven naar ./history")
 
