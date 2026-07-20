@@ -1,4 +1,4 @@
-# GexLevels — Insallation
+# GexLevels — Installation
 
 Zo werkt de keten:
 
