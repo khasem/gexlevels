@@ -51,7 +51,7 @@ from pathlib import Path
 
 import requests
 
-CALC_VERSION = "1.3.2"
+CALC_VERSION = "1.4.0"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
 FLIP_METHOD = os.environ.get("FLIP_METHOD", "profile")     # "profile" (gamma-profiel vs spot) of "cumulative" (oude methode)
 GAMMA_RANK  = os.environ.get("GAMMA_RANK", "total")        # "total" (call+put gamma) of "net" (|call−put|, oude methode)
@@ -99,7 +99,7 @@ def parse_cboe_ts(payload: dict) -> int | None:
     return None
 
 
-def fetch_cboe(ticker: str) -> tuple[list[dict], float, int | None]:
+def fetch_cboe(ticker: str) -> tuple[list[dict], float, int | None, float | None]:
     """Gratis delayed keten van CBOE. Indexen: geef ticker met underscore (bv. _SPX)."""
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker.upper()}.json"
     r = requests.get(url, headers=UA, timeout=30)
@@ -108,6 +108,12 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float, int | None]:
     quote_ts = parse_cboe_ts(payload)
     d = payload.get("data") or {}
     spot = float(d.get("current_price") or d.get("close") or 0)
+    # Officiële close van de vorige handelsdag. Dit is het deterministische
+    # conversie-anker voor de indicator: de vorige dagclose van het chartsymbool
+    # gedeeld door deze waarde is een prijspaar van (vrijwel) hetzelfde moment
+    # en op elke chart-timeframe identiek — geen live prijs, dus geen spreiding
+    # tussen timeframes of tussen chart-loads.
+    prev_close = float(d.get("prev_day_close") or 0) or None
     out: list[dict] = []
     for o in d.get("options", []):
         parsed = parse_occ(o.get("option", ""))
@@ -126,10 +132,10 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float, int | None]:
                     "bid": float(o.get("bid") or 0), "ask": float(o.get("ask") or 0)})
     if not spot:
         sys.exit(f"FOUT: geen spotprijs in CBOE-respons voor {ticker}")
-    return out, spot, quote_ts
+    return out, spot, quote_ts, prev_close
 
 
-def fetch_chain(ticker: str) -> tuple[list[dict], float, int | None]:
+def fetch_chain(ticker: str) -> tuple[list[dict], float, int | None, float | None]:
     src = os.environ.get("DATA_SOURCE", "cboe").lower()
     if src != "cboe":
         sys.exit(f"FOUT: DATA_SOURCE '{src}' wordt niet ondersteund — alleen 'cboe' is geïmplementeerd.")
@@ -411,15 +417,17 @@ def main() -> None:
 
     print("→ Bron: CBOE (delayed)")
     print(f"→ Ophalen {UNDERLYING} keten…")
-    chain, spot, quote_ts = fetch_chain(UNDERLYING)
+    chain, spot, quote_ts, prev_close = fetch_chain(UNDERLYING)
     res = compute_gex(chain, spot, today)
     print(f"   spot={spot:.2f}, contracten={len(chain)}")
 
     corr_results = []
+    corr_prev_closes: list[float | None] = []
     for csym in CORR_LIST:
         print(f"→ Ophalen {csym} keten…")
-        cchain, cspot, _cts = fetch_chain(csym)
+        cchain, cspot, _cts, cprev = fetch_chain(csym)
         corr_results.append((csym, compute_gex(cchain, cspot, today)))
+        corr_prev_closes.append(cprev)
         print(f"   spot={cspot:.2f}, contracten={len(cchain)}")
     # eerste correlated asset voedt de λ-levels op de chart (optioneel)
     cres = corr_results[0][1] if corr_results else None
@@ -519,6 +527,15 @@ def main() -> None:
     parts.append(f"SPOT:{spot:.2f}")
     if corr_results and corr_results[0][1].get("spot"):
         parts.append(f"CSPOT:{corr_results[0][1]['spot']:.2f}")
+    # PC/CPC = officiële vorige-dagclose (CBOE). De indicator ankert de
+    # strike→chart-conversie hierop: vorige dagclose chartsymbool ÷ PC.
+    # Beide zijden zijn afgeronde sessieprijzen → deterministisch, identiek
+    # op elke timeframe en op elk moment van de dag. SPOT/TS blijven in de
+    # paste staan als fallback voor oudere indicatorversies.
+    if prev_close:
+        parts.append(f"PC:{prev_close:.2f}")
+    if corr_prev_closes and corr_prev_closes[0]:
+        parts.append(f"CPC:{corr_prev_closes[0]:.2f}")
     # SYM/CSYM: het optiesymbool waar de strikes bij horen — de indicator neemt
     # dit over in de labels (bv. "GLD 369.5" i.p.v. "QQQ …" op een goudchart)
     parts.append(f"SYM:{pfx}")
@@ -531,6 +548,7 @@ def main() -> None:
     from zoneinfo import ZoneInfo
     parts.append("DT:" + dt.datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date().isoformat())
     print(f"→ TS-anker: {dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(timespec='seconds')} UTC  [{ts_src}]")
+    print(f"→ Prev close (PC-anker): {prev_close if prev_close else 'ontbreekt → indicator valt terug op TS-anker'}")
 
     paste = " ".join(parts)
     # Eén gecombineerd bestand: per underlying één regel (herkenbaar aan SYM:).
