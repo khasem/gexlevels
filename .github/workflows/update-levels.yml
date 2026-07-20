@@ -58,7 +58,7 @@ jobs:
         run: |
           git config user.name  "gex-bot"
           git config user.email "gex-bot@users.noreply.github.com"
-          git add data/ paste_string*.txt history/
+          git add data/ paste_string.txt history/
           git diff --cached --quiet || git commit -m "GEX levels $(date -u +'%Y-%m-%d %H:%M UTC')"
           git pull --rebase origin ${GITHUB_REF_NAME} || true
           git push
