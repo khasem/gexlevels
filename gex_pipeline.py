@@ -295,25 +295,26 @@ def compute_gex(chain: list[dict], spot: float, today: dt.date) -> dict:
 
 # ────────────────────────────── Live-script generator ──────────────────────────────
 
-def emit_live_script(paste: str, today: dt.date, pfx: str) -> bool:
-    """Schrijft data/GexLevels_live_<PFX>.pine: het volledige indicator-script met
-    de verse paste-string en datum al ingevuld — klaar om integraal te plakken."""
+def emit_live_script(today: dt.date) -> bool:
+    """Schrijft data/GexLevels_live.pine: het volledige indicator-script met de
+    gecombineerde paste-string (alle underlyings, \\n-gescheiden) al ingevuld."""
     tpl_path = Path(__file__).parent / "GexLevels.pine"
-    if not tpl_path.exists():
+    paste_path = Path(__file__).parent / "paste_string.txt"
+    if not tpl_path.exists() or not paste_path.exists():
         return False
+    combined = "\\n".join(l.strip() for l in paste_path.read_text().splitlines() if l.strip())
     src = tpl_path.read_text()
     out, done_p = [], False
     for line in src.splitlines():
         if not done_p and line.strip().startswith("pasteCode"):
-            line = f'pasteCode = "{paste}"   // {today.isoformat()}'
+            line = f'pasteCode = "{combined}"   // {today.isoformat()}'
             done_p = True
         out.append(line)
     if not done_p:
         return False
     dest_dir = Path(__file__).parent / "data"
     dest_dir.mkdir(exist_ok=True)
-    dest = dest_dir / f"GexLevels_live_{pfx}.pine"
-    dest.write_text("\n".join(out) + "\n")
+    (dest_dir / "GexLevels_live.pine").write_text("\n".join(out) + "\n")
     return True
 
 
@@ -532,10 +533,17 @@ def main() -> None:
     print(f"→ TS-anker: {dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(timespec='seconds')} UTC  [{ts_src}]")
 
     paste = " ".join(parts)
-    # per underlying een eigen bestand (paste_string_QQQ.txt, paste_string_GLD.txt, …)
-    (Path(__file__).parent / f"paste_string_{pfx}.txt").write_text(paste + "\n")
-    # legacy-bestand blijft bestaan; bevat de laatst gedraaide underlying
-    (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
+    # Eén gecombineerd bestand: per underlying één regel (herkenbaar aan SYM:).
+    # Een volgende run voor een andere underlying vervangt alleen zijn eigen
+    # regel — de indicator kiest zelf de juiste regel op basis van het chartsymbool.
+    paste_path = Path(__file__).parent / "paste_string.txt"
+    lines: list[str] = []
+    if paste_path.exists():
+        lines = [l.strip() for l in paste_path.read_text().splitlines() if l.strip()]
+    lines = [l for l in lines if f"SYM:{pfx}" not in l.split()]
+    lines.append(paste)
+    lines.sort()
+    paste_path.write_text("\n".join(lines) + "\n")
 
     # Dagelijkse historie-snapshot (t.b.v. vergelijking met eerdere sessies)
     hist_dir = Path(__file__).parent / "history"
@@ -590,8 +598,8 @@ def main() -> None:
     print(f"→ Gamma Flip-methode: {res.get('flip_method')}  |  flip = {f.get('flip')}")
     print("\n=== PASTE STRING ===")
     print(paste)
-    if emit_live_script(paste, today, pfx):
-        print(f"✓ Kant-en-klaar script: ./data/GexLevels_live_{pfx}.pine")
+    if emit_live_script(today):
+        print("✓ Kant-en-klaar script: ./data/GexLevels_live.pine")
     print("\n✓ CSV's geschreven naar ./data — klaar voor Pine Seeds sync")
     print("✓ Historie-snapshot geschreven naar ./history")
 
