@@ -51,7 +51,7 @@ from pathlib import Path
 
 import requests
 
-CALC_VERSION = "1.3.1"
+CALC_VERSION = "1.3.2"
 EM_FACTOR   = float(os.environ.get("EM_FACTOR", "0.85"))  # expected move ≈ 85% van de ATM-straddle (publieke benadering)
 FLIP_METHOD = os.environ.get("FLIP_METHOD", "profile")     # "profile" (gamma-profiel vs spot) of "cumulative" (oude methode)
 GAMMA_RANK  = os.environ.get("GAMMA_RANK", "total")        # "total" (call+put gamma) of "net" (|call−put|, oude methode)
@@ -82,12 +82,30 @@ def parse_occ(symbol: str) -> tuple[dt.date, str, float] | None:
     return exp, ("call" if cp == "C" else "put"), int(strike) / 1000.0
 
 
-def fetch_cboe(ticker: str) -> tuple[list[dict], float]:
+def parse_cboe_ts(payload: dict) -> int | None:
+    """Tijdstempel van de CBOE-quote zelf (Eastern Time) → epoch-seconden.
+    Cruciaal buiten markturen: de spot in de payload is dan bv. de vrijdagclose,
+    en het TS-anker moet naar dát moment wijzen — niet naar 'nu'."""
+    from zoneinfo import ZoneInfo
+    raw = payload.get("timestamp") or (payload.get("data") or {}).get("last_trade_time")
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            naive = dt.datetime.strptime(str(raw).strip(), fmt)
+        except ValueError:
+            continue
+        return int(naive.replace(tzinfo=ZoneInfo("America/New_York")).timestamp())
+    return None
+
+
+def fetch_cboe(ticker: str) -> tuple[list[dict], float, int | None]:
     """Gratis delayed keten van CBOE. Indexen: geef ticker met underscore (bv. _SPX)."""
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker.upper()}.json"
     r = requests.get(url, headers=UA, timeout=30)
     r.raise_for_status()
     payload = r.json()
+    quote_ts = parse_cboe_ts(payload)
     d = payload.get("data") or {}
     spot = float(d.get("current_price") or d.get("close") or 0)
     out: list[dict] = []
@@ -108,10 +126,10 @@ def fetch_cboe(ticker: str) -> tuple[list[dict], float]:
                     "bid": float(o.get("bid") or 0), "ask": float(o.get("ask") or 0)})
     if not spot:
         sys.exit(f"FOUT: geen spotprijs in CBOE-respons voor {ticker}")
-    return out, spot
+    return out, spot, quote_ts
 
 
-def fetch_chain(ticker: str) -> tuple[list[dict], float]:
+def fetch_chain(ticker: str) -> tuple[list[dict], float, int | None]:
     src = os.environ.get("DATA_SOURCE", "cboe").lower()
     if src != "cboe":
         sys.exit(f"FOUT: DATA_SOURCE '{src}' wordt niet ondersteund — alleen 'cboe' is geïmplementeerd.")
@@ -392,14 +410,14 @@ def main() -> None:
 
     print("→ Bron: CBOE (delayed)")
     print(f"→ Ophalen {UNDERLYING} keten…")
-    chain, spot = fetch_chain(UNDERLYING)
+    chain, spot, quote_ts = fetch_chain(UNDERLYING)
     res = compute_gex(chain, spot, today)
     print(f"   spot={spot:.2f}, contracten={len(chain)}")
 
     corr_results = []
     for csym in CORR_LIST:
         print(f"→ Ophalen {csym} keten…")
-        cchain, cspot = fetch_chain(csym)
+        cchain, cspot, _cts = fetch_chain(csym)
         corr_results.append((csym, compute_gex(cchain, cspot, today)))
         print(f"   spot={cspot:.2f}, contracten={len(cchain)}")
     cres = corr_results[0][1]   # eerste correlated asset voedt de λ-levels op de chart
@@ -485,14 +503,22 @@ def main() -> None:
             parts.append("MK:" + "|".join(marks))
 
     # Spot-ankers: hiermee verankert de indicator de strike→chart-conversie.
-    # TS = het feitelijke meetmoment van de spot (nu − feedvertraging); de
-    # indicator zoekt de chartbar bij TS en berekent de ratio met close-van-toen,
-    # zodat de conversie klopt ongeacht wanneer de chart geladen wordt.
+    # TS = het moment waarop de spot echt is vastgelegd. Voorkeur: het tijdstempel
+    # uit de CBOE-payload zelf — buiten markturen (avond/weekend) wijst dat naar
+    # de laatste sessie, zodat de indicator niet een live NQ-prijs door een
+    # bevroren QQQ-spot deelt. Fallback: nu − feedvertraging.
+    now = int(time.time())
+    if quote_ts and now - 6 * 86400 <= quote_ts <= now + 300:
+        ts = quote_ts
+        ts_src = "CBOE-quote"
+    else:
+        ts = now - int(SPOT_DELAY_MIN * 60)
+        ts_src = "klok−vertraging (geen bruikbaar quote-tijdstempel)"
     parts.append(f"SPOT:{spot:.2f}")
     if corr_results and corr_results[0][1].get("spot"):
         parts.append(f"CSPOT:{corr_results[0][1]['spot']:.2f}")
-    ts = int(time.time() - SPOT_DELAY_MIN * 60)
     parts.append(f"TS:{ts}")
+    print(f"→ TS-anker: {dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(timespec='seconds')} UTC  [{ts_src}]")
 
     paste = " ".join(parts)
     (Path(__file__).parent / "paste_string.txt").write_text(paste + "\n")
@@ -506,6 +532,7 @@ def main() -> None:
         "underlying": UNDERLYING, "spot": round(spot, 2),
         "data_source": "CBOE",
         "calculation_version": CALC_VERSION,
+        "quote_timestamp": quote_ts,
         "flip_method": res.get("flip_method"),
         "gamma_rank": GAMMA_RANK,
         "expiration_used": res.get("em_expiration"),
