@@ -15,6 +15,9 @@ on:
     - cron: "0 4,5,6,7 * * 1-5"    # 06:00-09:00 NL (zomertijd): ochtend-refresh, nieuwe dag-OI + verse 0DTE
     - cron: "0 8-12 * * 1-5"       # 10:00-14:00 NL (zomertijd): US-premarket, elk uur — verse spot
                                    #   tijdens de EU-ochtendsessie (spot beweegt vanaf 04:00 ET)
+    - cron: "0 23 * * 1-5"         # 01:00 NL (zomertijd): ná US-settlement — definitieve dagclose
+                                   #   als PC-anker voor de Azië-sessie (data is 's nachts verder
+                                   #   bevroren; extra nachtelijke runs voegen niets toe)
   workflow_dispatch: {}        # handmatig triggeren kan ook
 
 permissions:
