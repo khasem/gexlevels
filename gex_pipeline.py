@@ -512,24 +512,6 @@ def main() -> None:
         if marks:
             parts.append("MK:" + "|".join(marks))
 
-        # ── Gamma-tier-ladder (GT): puur op |netto GEX|-grootte ──
-        # Los van MK (dat confluentie meet). GT geeft élke significante strike
-        # binnen ±3% van spot een sterkte-tier op basis van zijn aandeel in de
-        # zwaarste concentratie — dit voedt het "vol profiel"-beeld op de chart
-        # (zoals GexDynamics: elke strike met gewicht krijgt [-]/[--]/[---]).
-        #   ≥60% van max → 3,  ≥30% → 2,  ≥8% → 1,  daaronder niet getoond.
-        gt_lo, gt_hi = res["spot"] * 0.96, res["spot"] * 1.04
-        gts = []
-        for k in sorted(net):
-            if not (gt_lo <= k <= gt_hi):
-                continue
-            frac = abs(net[k]) / mx
-            tier = 3 if frac >= 0.60 else 2 if frac >= 0.30 else 1 if frac >= 0.08 else 0
-            if tier:
-                gts.append(f"{k:g}={tier}")
-        if gts:
-            parts.append("GT:" + "|".join(gts))
-
     # Spot-ankers: hiermee verankert de indicator de strike→chart-conversie.
     # TS = het moment waarop de spot echt is vastgelegd. Voorkeur: het tijdstempel
     # uit de CBOE-payload zelf — buiten markturen (avond/weekend) wijst dat naar
