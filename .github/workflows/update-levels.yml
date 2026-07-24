@@ -53,7 +53,7 @@ jobs:
       - name: Compute GEX levels — QQQ
         env:
           UNDERLYING: QQQ
-          CORRELATED: _NDX         # secondary = NDX cash-index (λ-levels); underscore = index-endpoint
+          CORRELATED: SPY          # secondary = SPY (S&P) — cross-market confluence, fijnere strikes dan NDX
           FLIP_METHOD: profile     # of: cumulative (oude methode)
           GAMMA_RANK: total        # of: net (oude methode)
           SPOT_DELAY_MIN: "15"     # CBOE delayed-feed correctie voor het TS-anker
