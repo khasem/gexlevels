@@ -49,6 +49,17 @@ jobs:
           SPOT_DELAY_MIN: "15"
         run: python gex_pipeline.py
 
+      # SPY-regel voor ES/MES-charts: SPY primary (S&P Γ-levels) + QQQ secondary
+      # (Nasdaq als cross-market confluentie) — het spiegelbeeld van de QQQ-stap.
+      - name: Compute GEX levels — SPY (ES)
+        env:
+          UNDERLYING: SPY
+          CORRELATED: QQQ          # secondary = QQQ (Nasdaq) — cross-market confluence
+          FLIP_METHOD: profile
+          GAMMA_RANK: total
+          SPOT_DELAY_MIN: "15"
+        run: python gex_pipeline.py
+
       # QQQ als laatste: het legacy-bestand paste_string.txt bevat dan QQQ
       - name: Compute GEX levels — QQQ
         env:
